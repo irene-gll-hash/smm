@@ -1,0 +1,12 @@
+services:
+  qifa-smm:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GOOGLE_OAUTH_CLIENT_FILE: /app/secrets/google-oauth-client.json
+      GOOGLE_OAUTH_TOKEN_FILE: /app/secrets/google-oauth-token.json
+    volumes:
+      - ./data:/data
+      - ./secrets:/app/secrets
+
