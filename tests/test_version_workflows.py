@@ -308,3 +308,16 @@ class VersionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         before = copy.deepcopy(self.sheets.data)
         await self.service.build_plan(self.job(45, period_id='P'))
         self.assertEqual(self.sheets.data, before)
+
+    async def test_new_plan_job_finishes_interrupted_revision_first(self):
+        self.llm.json_response.side_effect = [self.proposal(), self.proposal('Next change')]
+        self.sheets.fail_after_append = self.cfg.sheet_plan
+        with self.assertRaises(RuntimeError):
+            await self.service.build_plan(self.job(46, period_id='P'))
+        self.new_service()
+        await self.service.build_plan(self.job(47, period_id='P'))
+        history = self.sheets.data[self.cfg.sheet_plan]
+        self.assertEqual([row['Версия плана'] for row in history], [1, 2, 3])
+        self.assertEqual([row['Решение редактора'] for row in history[:2]],
+                         [PlanDecision.SUPERSEDED.value, PlanDecision.SUPERSEDED.value])
+        self.assertEqual((await self.service.get_plan(self.post))['Краткое описание'], 'Next change')

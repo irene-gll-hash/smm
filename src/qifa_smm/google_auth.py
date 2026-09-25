@@ -1,13 +1,11 @@
 """Desktop OAuth with durable credentials and no interactive service startup."""
 from __future__ import annotations
-
 import json
 import logging
 import os
 from pathlib import Path
 import tempfile
 import threading
-
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow

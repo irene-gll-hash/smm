@@ -7,6 +7,7 @@ import re
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
+from pathlib import PurePosixPath
 from typing import Any
 from .config import Settings
 from .db import Database, Job
@@ -91,6 +92,53 @@ class PipelineService:
                 return row
         raise UserFacingError(f"Период {period_id!r} не найден")
 
+    @staticmethod
+    def _is_date_folder(name: str) -> bool:
+        return bool(
+            name == "Без даты"
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}", name)
+            or re.fullmatch(r"\d{2}[.-]\d{2}[.-]\d{4}", name)
+        )
+
+    @staticmethod
+    def _is_post_folder(name: str) -> bool:
+        return bool(re.match(r"^POST-[A-F0-9]{10}(?:\b|\s|—|-)", name, re.IGNORECASE))
+
+    @classmethod
+    def _material_groups(
+        cls, entries: list[DriveEntry]
+    ) -> tuple[dict[tuple[str, str], list[DriveEntry]], dict[tuple[str, str], str], int]:
+        """Map both date/theme and legacy theme/file layouts without reading post media."""
+        folder_links = {
+            PurePosixPath(entry.relative_path).parts: entry.web_view_link
+            for entry in entries
+            if entry.is_folder
+        }
+        groups: dict[tuple[str, str], list[DriveEntry]] = defaultdict(list)
+        links: dict[tuple[str, str], str] = {}
+        ignored = 0
+        for entry in entries:
+            if entry.is_folder:
+                continue
+            parts = PurePosixPath(entry.relative_path).parts
+            if len(parts) < 2:
+                ignored += 1
+                continue
+            if cls._is_date_folder(parts[0]):
+                date_folder = parts[0]
+                theme = parts[1] if len(parts) >= 3 else "Без темы"
+                if cls._is_post_folder(theme):
+                    ignored += 1
+                    continue
+                folder_path = (date_folder, theme) if theme != "Без темы" else (date_folder,)
+            else:
+                # Compatibility with the former period/theme/files layout.
+                date_folder, theme, folder_path = "", parts[0], (parts[0],)
+            key = (date_folder, theme)
+            groups[key].append(entry)
+            links[key] = folder_links.get(folder_path, "")
+        return groups, links, ignored
+
     async def process_materials(self, job: Job) -> str:
         period_id = str(job.payload["period_id"])
         period = await self._period(period_id)
@@ -98,21 +146,20 @@ class PipelineService:
         if not folder:
             raise UserFacingError("У периода не указана папка материалов")
         entries = await self.workspace.list_folder(folder)
-        theme_links = {item.name: item.web_view_link for item in entries if item.is_folder and "/" not in item.relative_path}
-        groups: dict[str, list[DriveEntry]] = defaultdict(list)
-        for entry in entries:
-            if entry.is_folder:
-                continue
-            theme = entry.relative_path.split("/", 1)[0]
-            if theme == "Без даты" or re.fullmatch(r"\d{4}-\d{2}-\d{2}", theme):
-                continue
-            groups[theme].append(entry)
+        groups, theme_links, ignored = self._material_groups(entries)
         updated = unchanged = unreadable = 0
-        for theme, files in groups.items():
+        for (source_date, theme), files in groups.items():
             sources: list[SourceItem] = []
-            changed = False
+            group_key = stable_hash({"period_id": period_id, "date": source_date, "theme": theme})
+            manifest = stable_hash([
+                {"id": entry.id, "path": entry.relative_path,
+                 "modified": entry.modified_time, "size": entry.size}
+                for entry in sorted(files, key=lambda item: (item.relative_path, item.id))
+            ])
+            changed = await self.database.get_setting(f"material-group:{group_key}") != manifest
             for entry in files:
-                fingerprint = stable_hash({"id": entry.id, "modified": entry.modified_time, "size": entry.size})
+                fingerprint = stable_hash({"id": entry.id, "path": entry.relative_path,
+                                           "modified": entry.modified_time, "size": entry.size})
                 changed = changed or not await self.database.source_is_current(entry.id, fingerprint)
                 try:
                     source = await self._extract_drive_entry(entry, fingerprint)
@@ -125,10 +172,11 @@ class PipelineService:
             if not changed:
                 unchanged += 1
                 continue
-            material_id = short_id("MAT", f"{period_id}:{theme}")
+            material_id = short_id("MAT", f"{period_id}:{source_date}:{theme}")
             response = await self.llm.json_response(
                 MATERIAL_ANALYZER,
-                json.dumps({"period_id": period_id, "material_id": material_id, "theme_folder": theme,
+                json.dumps({"period_id": period_id, "material_id": material_id,
+                            "date_folder": source_date, "theme_folder": theme,
                             "sources": [{"source_id": item.source_id, "name": item.name, "path": item.path,
                                          "url": item.url, "mime_type": item.mime_type, "readable": item.readable,
                                          "text": item.text[:40_000], "links": item.urls} for item in sources]},
@@ -142,9 +190,13 @@ class PipelineService:
             row = self._map_headers(headers, {
                 ("material_id", "ID материала", "Материал ID"): material_id,
                 ("period_id", "ID периода", "Период"): period_id,
-                ("Название материала", "Название"): response.get("title", theme),
+                ("Дата материалов", "Дата папки"): source_date,
+                ("Название материала", "Название"): (
+                    f"{source_date} — {response.get('title', theme)}" if source_date
+                    else response.get("title", theme)
+                ),
                 ("Категория",): response.get("category", ""),
-                ("Ссылка на папку", "Ссылка на папку / файл", "Источник"): theme_links.get(theme, folder),
+                ("Ссылка на папку", "Ссылка на папку / файл", "Источник"): theme_links.get((source_date, theme)) or folder,
                 ("Что произошло",): response.get("what_happened", ""),
                 ("Подтверждённые факты", "Факты"): "\n".join(facts),
                 ("Важная дата или эмбарго", "Эмбарго"): response.get("important_date_or_embargo", ""),
@@ -155,8 +207,10 @@ class PipelineService:
             await self.sheets.upsert_dicts(self.settings.sheet_materials, key, [row])
             for source in sources:
                 await self.database.save_source_file(source.source_id, source.fingerprint, period_id, source.path, source.readable)
+            await self.database.set_setting(f"material-group:{group_key}", manifest)
             updated += 1
-        return f"Материалы разобраны: обновлено {updated}, без изменений {unchanged}, нечитаемых файлов {unreadable}."
+        return (f"Материалы разобраны: обновлено {updated}, без изменений {unchanged}, "
+                f"нечитаемых файлов {unreadable}, пропущено вне тем/в папках постов {ignored}.")
 
     async def _extract_drive_entry(self, entry: DriveEntry, fingerprint: str) -> SourceItem:
         if entry.mime_type.startswith(("image/", "video/", "audio/")):

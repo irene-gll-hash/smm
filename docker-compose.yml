@@ -6,7 +6,7 @@ services:
     environment:
       GOOGLE_OAUTH_CLIENT_FILE: /app/secrets/google-oauth-client.json
       GOOGLE_OAUTH_TOKEN_FILE: /app/secrets/google-oauth-token.json
+      DATABASE_PATH: /data/qifa_smm.sqlite3
     volumes:
       - ./data:/data
       - ./secrets:/app/secrets
-
